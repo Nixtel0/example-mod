@@ -8,7 +8,7 @@
 	},
 	"id": "nixtel0.predictive_delay_console",
 	"name": "Predictive Delay Buffer",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"developer": "Nixtel0",
 	"description": "Buffer predictivo con consola externa para pruebas de colisiones y ticks."
 }

@@ -4,6 +4,9 @@
 #include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/CCKeyboardDispatcher.hpp>
 #include <deque>
+#include <vector>
+#include <cmath>
+#include <string>
 #include <iostream>
 
 #ifdef GEODE_IS_WINDOWS
@@ -21,19 +24,18 @@ enum BufferStage {
     STAGE_8_TICKS = 3
 };
 
-// Cuantos ticks hacia delante simulamos tras el press para ver si muere.
-// Un salto que cae en un spike tarda bastantes ticks en matar, por eso 1 tick no bastaba.
+// Ticks que simula hacia delante el predictor (F7 lo cambia)
 static constexpr int LOOKAHEAD_TICKS = 60;
-// Asumimos que el press es un toque corto: se suelta tras estos ticks en la simulacion.
+// El predictor asume un toque corto: suelta el boton tras estos ticks
 static constexpr int ASSUMED_HOLD_TICKS = 3;
+// Dos posiciones X se consideran el mismo tick si difieren menos de esto
+static constexpr float SAME_TICK_TOLERANCE = 0.25f;
 
 struct SimResult {
     bool died = false;
-    int deathTick = -1;   // tick (desde el inicio de la simulacion) en el que muere
-    float xStart = 0.f;
-    float xEnd = 0.f;
-    float yStart = 0.f;
-    float yEnd = 0.f;
+    int deathTick = -1;
+    float xStart = 0.f, xEnd = 0.f;
+    float yStart = 0.f, yEnd = 0.f;
 };
 
 struct PendingInput {
@@ -41,7 +43,8 @@ struct PendingInput {
     int button;
     bool isPlayer1;
     int ticksWaited;   // ticks esperados hasta ahora
-    int delayTarget;   // ticks que hay que esperar antes de soltar este input (solo presses)
+    int delayTarget;   // retraso fijo (predictor). Ignorado si learned == true
+    bool learned;      // true: esperar hasta que la X actual deje de estar marcada como "mortal"
 };
 
 class BufferState {
@@ -63,8 +66,9 @@ public:
             freopen_s(&fp, "CONIN$", "r", stdin);
 
             std::cout << "========================================================\n";
-            std::cout << "[InputBuffer] LOADED - Lookahead Prediction Engine Active\n";
-            std::cout << "[InputBuffer] F6: ciclar OFF -> 2T -> 4T -> 8T | F7: lookahead 15/30/60/120/240 | F8: debug\n";
+            std::cout << "[InputBuffer] LOADED\n";
+            std::cout << "[InputBuffer] F6: modo OFF/2T/4T/8T | F7: lookahead 15/30/60/120/240\n";
+            std::cout << "[InputBuffer] F8: debug | F9: predictor ON/OFF | F10: olvidar lo aprendido\n";
             std::cout << "========================================================\n\n";
             std::cout << std::flush;
             m_initialized = true;
@@ -97,18 +101,6 @@ public:
 
     bool isEnabled() const { return m_stage != STAGE_OFF; }
 
-    std::deque<PendingInput> queue;
-
-    bool isSimulating = false;
-    bool simulationDied = false;
-    bool isFlushing = false;
-
-    // Logs detallados de simulacion (F8). Apagado por defecto.
-    bool debug = false;
-
-    // Ticks que se simulan hacia delante tras el press (F7 los cambia: 15 / 30 / 60 / 120 / 240)
-    int lookahead = LOOKAHEAD_TICKS;
-
     void cycleLookahead() {
         switch (lookahead) {
             case 15:  lookahead = 30;  break;
@@ -127,9 +119,55 @@ public:
         std::cout << "[InputBuffer] F8 -> debug " << (debug ? "ON" : "OFF") << "\n" << std::flush;
     }
 
-    // dt real de un tick de fisica (se actualiza desde processCommands)
+    void toggleSim() {
+        useSim = !useSim;
+        std::cout << "[InputBuffer] F9 -> predictor " << (useSim ? "ON" : "OFF") << "\n" << std::flush;
+    }
+
+    // --- Aprendizaje a partir de muertes reales ---
+    bool isBadX(float x) const {
+        for (float b : badX) {
+            if (std::fabs(b - x) < SAME_TICK_TOLERANCE) return true;
+        }
+        return false;
+    }
+
+    void addBadX(float x) {
+        if (!isBadX(x)) badX.push_back(x);
+    }
+
+    void clearLearned() {
+        badX.clear();
+        lastPressValid = false;
+        std::cout << "[InputBuffer] F10 -> olvidado todo lo aprendido\n" << std::flush;
+    }
+
+    void recordPress(float x) {
+        lastPressValid = true;
+        lastPressX = x;
+        lastPressTick = tickCounter;
+    }
+
+    // Estado
+    std::deque<PendingInput> queue;
+
+    bool isSimulating = false;
+    bool simulationDied = false;
+    bool isFlushing = false;
+
+    bool debug = false;
+    bool useSim = true;
+    int lookahead = LOOKAHEAD_TICKS;
+
     float stepDt = 1.0f / 240.0f;
-    int debugCalls = 0; // para loguear las primeras llamadas a processCommands tras un retraso
+    int debugCalls = 0;
+    int tickCounter = 0;
+
+    std::vector<float> badX;
+    bool lastPressValid = false;
+    float lastPressX = 0.f;
+    int lastPressTick = 0;
+    std::string currentLevel;
 
 private:
     bool m_initialized = false;
@@ -160,9 +198,7 @@ class $modify(PredictivePlayerObject, PlayerObject) {
 
 class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
 
-    // Simula hacia delante: espera `delay` ticks, hace el press, y avanza hasta
-    // LOOKAHEAD_TICKS mas. Devuelve si el jugador muere y datos de depuracion.
-    // Al terminar restaura el estado del jugador con un PlayerCheckpoint.
+    // Predictor: simula hacia delante y devuelve si el jugador muere.
     SimResult simulateDies(PlayerObject* player, int delay, int button) {
         SimResult r;
         if (!player || player->m_isDead) return r;
@@ -185,7 +221,6 @@ class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
 
         for (int t = 0; t < total; ++t) {
             if (t == delay) {
-                // Mismo camino que el juego real (no pushButton a pelo)
                 GJBaseGameLayer::handleButton(true, button, true);
             } else if (t == delay + ASSUMED_HOLD_TICKS) {
                 GJBaseGameLayer::handleButton(false, button, true);
@@ -221,62 +256,68 @@ class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
 
         // Si ya hay algo pendiente, lo nuevo va detras para mantener el orden
         if (!st.queue.empty()) {
-            st.queue.push_back({ isDown, button, isPlayer1, 0, 0 });
+            st.queue.push_back({ isDown, button, isPlayer1, 0, 0, false });
             return;
         }
 
-        // Solo gestionamos al jugador 1 (el jugador 2 inactivo estaba en x=0 y daba basura)
         if (isDown && isPlayer1 && m_player1) {
             PlayerObject* target = m_player1;
-            int maxTicks = st.getMaxTicks();
+            const float x = target->getPositionX();
+            const int maxTicks = st.getMaxTicks();
 
-            if (st.debug) {
-                std::cout << "[InputBuffer][DEBUG] PRESS btn=" << button
-                          << " x=" << target->getPositionX()
-                          << " y=" << target->getPositionY()
-                          << " dead=" << target->m_isDead
-                          << " dt=" << st.stepDt << "\n";
-            }
-
-            // Buscamos el menor retraso d (0..max) con el que NO mueres
-            int safeDelay = -1;
-            for (int d = 0; d <= maxTicks; ++d) {
-                SimResult r = simulateDies(target, d, button);
-                if (st.debug) {
-                    std::cout << "    [sim] retraso=" << d
-                              << " muere=" << r.died
-                              << " en_tick=" << r.deathTick
-                              << " x:" << r.xStart << "->" << r.xEnd
-                              << " y:" << r.yStart << "->" << r.yEnd << "\n";
-                }
-                if (!r.died) {
-                    safeDelay = d;
-                    break;
+            // 1) Predictor (simulacion)
+            int safeDelay = 0;
+            if (st.useSim) {
+                safeDelay = -1;
+                for (int d = 0; d <= maxTicks; ++d) {
+                    SimResult r = simulateDies(target, d, button);
+                    if (st.debug) {
+                        std::cout << "    [sim] retraso=" << d
+                                  << " muere=" << r.died
+                                  << " en_tick=" << r.deathTick
+                                  << " x:" << r.xStart << "->" << r.xEnd
+                                  << " y:" << r.yStart << "->" << r.yEnd << "\n";
+                    }
+                    if (!r.died) { safeDelay = d; break; }
                 }
             }
+
+            // 2) Lo aprendido de muertes reales: un click en esta X ya te mato antes
+            const bool learnedBad = st.isBadX(x);
+
             if (st.debug) {
-                std::cout << "    => retraso_seguro=" << safeDelay << " (max " << maxTicks << ")\n" << std::flush;
+                std::cout << "[InputBuffer][DEBUG] PRESS x=" << x
+                          << " predictor_retraso=" << safeDelay
+                          << " aprendido_mortal=" << learnedBad
+                          << " (max " << maxTicks << ")\n" << std::flush;
             }
 
             if (safeDelay > 0) {
-                float ms = safeDelay * (1000.0f / 240.0f);
-                std::cout << "[InputBuffer] Retrasado " << safeDelay
-                          << " ticks (" << ms << " ms)\n" << std::flush;
-                st.queue.push_back({ isDown, button, isPlayer1, 0, safeDelay });
+                st.queue.push_back({ isDown, button, isPlayer1, 0, safeDelay, false });
                 st.debugCalls = 0;
                 return;
             }
-            // safeDelay == 0 -> ya es seguro; -1 -> ningun retraso salva: no tocamos nada
+            if (learnedBad) {
+                st.queue.push_back({ isDown, button, isPlayer1, 0, 0, true });
+                st.debugCalls = 0;
+                return;
+            }
+
+            // Pasa directo: guardamos donde se hizo el click para poder aprender si mueres
+            st.recordPress(x);
         }
 
         GJBaseGameLayer::handleButton(isDown, button, isPlayer1);
     }
 
-    // GD 2.2081: se llama una vez por tick de fisica
+    // GD 2.2081: se llama una vez por tick de fisica (y por medio tick)
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto& st = BufferState::get();
 
-        if (!st.isSimulating) st.stepDt = dt > 0.f ? dt : st.stepDt;
+        if (!st.isSimulating) {
+            st.stepDt = dt > 0.f ? dt : st.stepDt;
+            st.tickCounter++;
+        }
 
         if (st.isEnabled() && !st.queue.empty()) {
             if (st.debug && st.debugCalls < 12) {
@@ -291,11 +332,28 @@ class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
 
                 if (pending.isDown) {
                     pending.ticksWaited++;
-                    if (pending.ticksWaited < pending.delayTarget) break; // aun toca esperar
+
+                    if (pending.learned) {
+                        // Esperar mientras esta X siga marcada como mortal (hasta el maximo del modo)
+                        float x = m_player1 ? m_player1->getPositionX() : 0.f;
+                        if (st.isBadX(x) && pending.ticksWaited < st.getMaxTicks()) break;
+                    } else {
+                        if (pending.ticksWaited < pending.delayTarget) break;
+                    }
                 }
 
                 PendingInput p = pending;
                 st.queue.pop_front();
+
+                if (p.isDown && p.isPlayer1 && m_player1) {
+                    st.recordPress(m_player1->getPositionX());
+                    if (p.ticksWaited > 0) {
+                        float ms = p.ticksWaited * (1000.0f / 240.0f);
+                        std::cout << "[InputBuffer] Retrasado " << p.ticksWaited
+                                  << " ticks (" << ms << " ms)"
+                                  << (p.learned ? " [aprendido]" : " [predictor]") << "\n" << std::flush;
+                    }
+                }
 
                 st.isFlushing = true;
                 GJBaseGameLayer::handleButton(p.isDown, p.button, p.isPlayer1);
@@ -310,8 +368,17 @@ class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
 class $modify(PredictivePlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
-        BufferState::get().initConsole();
-        BufferState::get().queue.clear();
+        auto& st = BufferState::get();
+        st.initConsole();
+        st.queue.clear();
+        st.lastPressValid = false;
+
+        // Si cambias de nivel, se olvida lo aprendido del anterior
+        std::string name = level ? std::string(level->m_levelName) : std::string();
+        if (name != st.currentLevel) {
+            st.badX.clear();
+            st.currentLevel = name;
+        }
         return true;
     }
 
@@ -321,28 +388,42 @@ class $modify(PredictivePlayLayer, PlayLayer) {
         st.isSimulating = false;
         st.simulationDied = false;
         st.isFlushing = false;
+        st.lastPressValid = false;
         PlayLayer::resetLevel();
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
-        if (BufferState::get().isSimulating) {
-            BufferState::get().simulationDied = true;
+        auto& st = BufferState::get();
+
+        if (st.isSimulating) {
+            st.simulationDied = true;
             return;
         }
+
+        // Muerte real: si ocurrio poco despues de un click, ese click en esa X era mortal
+        if (st.isEnabled() && player == m_player1 && st.lastPressValid) {
+            int ticksSincePress = st.tickCounter - st.lastPressTick;
+            if (ticksSincePress <= st.lookahead) {
+                st.addBadX(st.lastPressX);
+                std::cout << "[InputBuffer] Aprendido: click en x=" << st.lastPressX
+                          << " te mato " << ticksSincePress
+                          << " ticks despues -> la proxima vez se retrasara\n" << std::flush;
+            }
+            st.lastPressValid = false;
+        }
+
         PlayLayer::destroyPlayer(player, object);
     }
 };
 
 class $modify(BufferKeyboardHook, CCKeyboardDispatcher) {
     bool dispatchKeyboardMSG(enumKeyCodes key, bool isKeyDown, bool isKeyRepeat, double timestamp) {
-        if (isKeyDown && !isKeyRepeat && key == enumKeyCodes::KEY_F6) {
-            BufferState::get().cycleMode();
-        }
-        if (isKeyDown && !isKeyRepeat && key == enumKeyCodes::KEY_F7) {
-            BufferState::get().cycleLookahead();
-        }
-        if (isKeyDown && !isKeyRepeat && key == enumKeyCodes::KEY_F8) {
-            BufferState::get().toggleDebug();
+        if (isKeyDown && !isKeyRepeat) {
+            if (key == enumKeyCodes::KEY_F6) BufferState::get().cycleMode();
+            else if (key == enumKeyCodes::KEY_F7) BufferState::get().cycleLookahead();
+            else if (key == enumKeyCodes::KEY_F8) BufferState::get().toggleDebug();
+            else if (key == enumKeyCodes::KEY_F9) BufferState::get().toggleSim();
+            else if (key == enumKeyCodes::KEY_F10) BufferState::get().clearLearned();
         }
         return CCKeyboardDispatcher::dispatchKeyboardMSG(key, isKeyDown, isKeyRepeat, timestamp);
     }

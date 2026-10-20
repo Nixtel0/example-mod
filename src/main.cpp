@@ -119,7 +119,6 @@ class $modify(LookaheadPlayLayer, PlayLayer) {
     struct PlayerSnapshot {
         cocos2d::CCPoint position;
         double yVelocity;
-        double xVelocity;
         float rotation;
         bool isDead;
         bool isOnGround;
@@ -129,7 +128,6 @@ class $modify(LookaheadPlayLayer, PlayLayer) {
         return {
             player->getPosition(),
             player->m_yVelocity,
-            player->m_xVelocity,
             player->getRotation(),
             player->m_isDead,
             player->m_isOnGround
@@ -139,7 +137,6 @@ class $modify(LookaheadPlayLayer, PlayLayer) {
     void restoreSnapshot(PlayerObject* player, const PlayerSnapshot& snap) {
         player->setPosition(snap.position);
         player->m_yVelocity = snap.yVelocity;
-        player->m_xVelocity = snap.xVelocity;
         player->setRotation(snap.rotation);
         player->m_isDead = snap.isDead;
         player->m_isOnGround = snap.isOnGround;
@@ -166,7 +163,7 @@ class $modify(LookaheadPlayLayer, PlayLayer) {
 
     void pushButton(int state, bool isPlayer2) {
         if (m_fields->isSimulating || !ConsoleManager::get().isEnabled()) {
-            PlayLayer::pushButton(state, isPlayer2);
+            GJBaseGameLayer::pushButton(state, isPlayer2);
             return;
         }
 
@@ -178,7 +175,7 @@ class $modify(LookaheadPlayLayer, PlayLayer) {
             return;
         }
 
-        PlayLayer::pushButton(state, isPlayer2);
+        GJBaseGameLayer::pushButton(state, isPlayer2);
     }
 
     void update(float dt) {
@@ -191,7 +188,7 @@ class $modify(LookaheadPlayLayer, PlayLayer) {
                 if (nextInput.ticksDelayed > 0) {
                     ConsoleManager::get().logSavedInput(nextInput.ticksDelayed, nextInput.isDown);
                 }
-                PlayLayer::pushButton(0, !nextInput.isPlayer2);
+                GJBaseGameLayer::pushButton(0, !nextInput.isPlayer2);
                 m_fields->pendingInputs.pop_front();
             } else {
                 nextInput.ticksDelayed++;
@@ -202,7 +199,7 @@ class $modify(LookaheadPlayLayer, PlayLayer) {
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
-        if (m_fields && m_fields->isSimulating) {
+        if (m_fields->isSimulating) {
             player->m_isDead = true;
             return;
         }
@@ -210,7 +207,6 @@ class $modify(LookaheadPlayLayer, PlayLayer) {
     }
 };
 
-// Firma actualizada a 4 parametros para compatibilidad con Geode v4/v5
 class $modify(BufferKeyboardHook, CCKeyboardDispatcher) {
     bool dispatchKeyboardMSG(enumKeyCodes key, bool isKeyDown, bool isKeyRepeat, double timestamp) {
         if (isKeyDown && !isKeyRepeat && key == enumKeyCodes::KEY_F6) {

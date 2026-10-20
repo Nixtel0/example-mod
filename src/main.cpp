@@ -21,8 +21,12 @@ enum BufferStage {
     STAGE_OFF = 0,
     STAGE_2_TICKS = 1,
     STAGE_4_TICKS = 2,
-    STAGE_8_TICKS = 3
+    STAGE_8_TICKS = 3,
+    STAGE_16_TICKS = 4,
+    STAGE_32_TICKS = 5
 };
+
+static constexpr int STAGE_COUNT = 6;
 
 // Ticks que simula hacia delante el predictor (F7 lo cambia)
 static constexpr int LOOKAHEAD_TICKS = 60;
@@ -67,7 +71,7 @@ public:
 
             std::cout << "========================================================\n";
             std::cout << "[InputBuffer] LOADED\n";
-            std::cout << "[InputBuffer] F6: modo OFF/2T/4T/8T | F7: lookahead 15/30/60/120/240\n";
+            std::cout << "[InputBuffer] F6: modo OFF/2T/4T/8T/16T/32T | F7: lookahead 15/30/60/120/240\n";
             std::cout << "[InputBuffer] F8: debug | F9: predictor ON/OFF | F10: olvidar lo aprendido\n";
             std::cout << "========================================================\n\n";
             std::cout << std::flush;
@@ -77,14 +81,14 @@ public:
         if (!m_loaded) {
             m_loaded = true;
             int saved = Mod::get()->getSavedValue<int>("stage", static_cast<int>(STAGE_2_TICKS));
-            if (saved < 0 || saved > 3) saved = static_cast<int>(STAGE_2_TICKS);
+            if (saved < 0 || saved >= STAGE_COUNT) saved = static_cast<int>(STAGE_2_TICKS);
             m_stage = static_cast<BufferStage>(saved);
             printStatus();
         }
     }
 
     void cycleMode() {
-        m_stage = static_cast<BufferStage>((m_stage + 1) % 4);
+        m_stage = static_cast<BufferStage>((m_stage + 1) % STAGE_COUNT);
         Mod::get()->setSavedValue<int>("stage", static_cast<int>(m_stage));
         if (m_stage == STAGE_OFF) queue.clear();
         printStatus();
@@ -95,6 +99,8 @@ public:
             case STAGE_2_TICKS: return 2;
             case STAGE_4_TICKS: return 4;
             case STAGE_8_TICKS: return 8;
+            case STAGE_16_TICKS: return 16;
+            case STAGE_32_TICKS: return 32;
             default: return 0;
         }
     }
@@ -181,6 +187,8 @@ private:
             case STAGE_2_TICKS:  std::cout << "STAGE 1: 2 Ticks (~8.3 ms)\n"; break;
             case STAGE_4_TICKS:  std::cout << "STAGE 2: 4 Ticks (~16.6 ms)\n"; break;
             case STAGE_8_TICKS:  std::cout << "STAGE 3: 8 Ticks (~33.3 ms)\n"; break;
+            case STAGE_16_TICKS: std::cout << "STAGE 4: 16 Ticks (~66.7 ms)\n"; break;
+            case STAGE_32_TICKS: std::cout << "STAGE 5: 32 Ticks (~133.3 ms)\n"; break;
         }
         std::cout << std::flush;
     }
@@ -293,11 +301,15 @@ class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
             }
 
             if (safeDelay > 0) {
+                std::cout << "[InputBuffer] CLICK RETENIDO en x=" << x
+                          << " [predictor] (retraso previsto " << safeDelay << " ticks)\n" << std::flush;
                 st.queue.push_back({ isDown, button, isPlayer1, 0, safeDelay, false });
                 st.debugCalls = 0;
                 return;
             }
             if (learnedBad) {
+                std::cout << "[InputBuffer] CLICK RETENIDO en x=" << x
+                          << " [aprendido] (esa posicion te mato antes)\n" << std::flush;
                 st.queue.push_back({ isDown, button, isPlayer1, 0, 0, true });
                 st.debugCalls = 0;
                 return;
@@ -349,8 +361,8 @@ class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
                     st.recordPress(m_player1->getPositionX());
                     if (p.ticksWaited > 0) {
                         float ms = p.ticksWaited * (1000.0f / 240.0f);
-                        std::cout << "[InputBuffer] Retrasado " << p.ticksWaited
-                                  << " ticks (" << ms << " ms)"
+                        std::cout << "[InputBuffer] CLICK DEVUELTO AL JUEGO en x=" << m_player1->getPositionX()
+                                  << " tras " << p.ticksWaited << " ticks (" << ms << " ms)"
                                   << (p.learned ? " [aprendido]" : " [predictor]") << "\n" << std::flush;
                     }
                 }

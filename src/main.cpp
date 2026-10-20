@@ -21,14 +21,20 @@ enum BufferStage {
     STAGE_8_TICKS = 3
 };
 
+// Cuantos ticks hacia delante simulamos tras el press para ver si muere.
+// Un salto que cae en un spike tarda bastantes ticks en matar, por eso 1 tick no bastaba.
+static constexpr int LOOKAHEAD_TICKS = 60;
+// Asumimos que el press es un toque corto: se suelta tras estos ticks en la simulacion.
+static constexpr int ASSUMED_HOLD_TICKS = 3;
+
 struct PendingInput {
     bool isDown;
     int button;
     bool isPlayer1;
-    int ticksDelayed;
+    int ticksWaited;   // ticks esperados hasta ahora
+    int delayTarget;   // ticks que hay que esperar antes de soltar este input (solo presses)
 };
 
-// Estado global del mod (modo, consola, cola de inputs y flags de simulación)
 class BufferState {
 public:
     static BufferState& get() {
@@ -38,25 +44,23 @@ public:
 
     void initConsole() {
 #ifdef GEODE_IS_WINDOWS
-        if (m_initialized) return;
+        if (!m_initialized) {
+            AllocConsole();
+            SetConsoleTitleA("Dynamic Prediction Input Buffer - Live Console");
 
-        AllocConsole();
-        SetConsoleTitleA("Dynamic Prediction Input Buffer - Live Console");
+            FILE* fp;
+            freopen_s(&fp, "CONOUT$", "w", stdout);
+            freopen_s(&fp, "CONOUT$", "w", stderr);
+            freopen_s(&fp, "CONIN$", "r", stdin);
 
-        FILE* fp;
-        freopen_s(&fp, "CONOUT$", "w", stdout);
-        freopen_s(&fp, "CONOUT$", "w", stderr);
-        freopen_s(&fp, "CONIN$", "r", stdin);
-
-        std::cout << "========================================================\n";
-        std::cout << "[InputBuffer] LOADED - Lookahead Prediction Engine Active\n";
-        std::cout << "[InputBuffer] Presiona F6 para ciclar: OFF -> 2T -> 4T -> 8T\n";
-        std::cout << "========================================================\n\n";
-        std::cout << std::flush;
-
-        m_initialized = true;
+            std::cout << "========================================================\n";
+            std::cout << "[InputBuffer] LOADED - Lookahead Prediction Engine Active\n";
+            std::cout << "[InputBuffer] Presiona F6 para ciclar: OFF -> 2T -> 4T -> 8T\n";
+            std::cout << "========================================================\n\n";
+            std::cout << std::flush;
+            m_initialized = true;
+        }
 #endif
-        // Restaurar el modo guardado la primera vez
         if (!m_loaded) {
             m_loaded = true;
             int saved = Mod::get()->getSavedValue<int>("stage", static_cast<int>(STAGE_2_TICKS));
@@ -69,7 +73,7 @@ public:
     void cycleMode() {
         m_stage = static_cast<BufferStage>((m_stage + 1) % 4);
         Mod::get()->setSavedValue<int>("stage", static_cast<int>(m_stage));
-        if (m_stage == STAGE_OFF) queue.clear(); // al apagar, no dejamos inputs colgados
+        if (m_stage == STAGE_OFF) queue.clear();
         printStatus();
     }
 
@@ -84,22 +88,15 @@ public:
 
     bool isEnabled() const { return m_stage != STAGE_OFF; }
 
-    void logSavedInput(int ticksDelayed) {
-        float msSaved = ticksDelayed * (1000.0f / 240.0f);
-        std::cout << "[InputBuffer] SAVED: press retrasado " << ticksDelayed
-                  << " ticks (" << msSaved << " ms) para evitar muerte\n" << std::flush;
-        log::info("InputBuffer: press retrasado {} ticks ({} ms)", ticksDelayed, msSaved);
-    }
-
-    // Cola de inputs pendientes (en orden de llegada)
     std::deque<PendingInput> queue;
 
-    // true mientras estamos en una micro-simulación
     bool isSimulating = false;
     bool simulationDied = false;
-
-    // true mientras soltamos nosotros un input de la cola (evita reentrada en handleButton)
     bool isFlushing = false;
+
+    // dt real de un tick de fisica (se actualiza desde processCommands)
+    float stepDt = 1.0f / 240.0f;
+    int debugCalls = 0; // para loguear las primeras llamadas a processCommands tras un retraso
 
 private:
     bool m_initialized = false;
@@ -118,7 +115,6 @@ private:
     }
 };
 
-// Evita que la simulación mate al jugador de verdad
 class $modify(PredictivePlayerObject, PlayerObject) {
     void playerDestroyed(bool p0) {
         if (BufferState::get().isSimulating) {
@@ -131,10 +127,10 @@ class $modify(PredictivePlayerObject, PlayerObject) {
 
 class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
 
-    // Simula 1 tick con el input aplicado y devuelve true si el jugador moriría.
-    // Usa un PlayerCheckpoint completo (el mismo que usan los checkpoints del juego)
-    // en vez de copiar campos a mano.
-    bool testIfInputKills(PlayerObject* player, bool isDown, int button) {
+    // Simula hacia delante: espera `delay` ticks, hace el press, y avanza hasta
+    // LOOKAHEAD_TICKS mas. Devuelve true si el jugador muere en ese tiempo.
+    // Al terminar restaura el estado del jugador con un PlayerCheckpoint.
+    bool simulateDies(PlayerObject* player, int delay, int button) {
         if (!player || player->m_isDead) return false;
 
         auto& st = BufferState::get();
@@ -147,79 +143,97 @@ class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
         st.isSimulating = true;
         st.simulationDied = false;
 
-        if (isDown) player->pushButton(static_cast<PlayerButton>(button));
-        else player->releaseButton(static_cast<PlayerButton>(button));
+        bool died = false;
+        const float dt = st.stepDt;
+        const int total = delay + LOOKAHEAD_TICKS;
 
-        const float stepDt = 1.0f / 240.0f;
-        player->update(stepDt);
-        this->checkCollisions(player, stepDt, false);
+        for (int t = 0; t < total && !died; ++t) {
+            if (t == delay) {
+                player->pushButton(static_cast<PlayerButton>(button));
+            } else if (t == delay + ASSUMED_HOLD_TICKS) {
+                player->releaseButton(static_cast<PlayerButton>(button));
+            }
+            player->update(dt);
+            this->checkCollisions(player, dt, false);
+            died = st.simulationDied || player->m_isDead;
+        }
 
-        bool wouldDie = st.simulationDied || player->m_isDead;
-
-        // Restaurar todo
         st.isSimulating = false;
         st.simulationDied = false;
         player->loadFromCheckpoint(cp);
         player->m_isDead = false;
 
         cp->release();
-        return wouldDie;
+        return died;
     }
 
     void handleButton(bool isDown, int button, bool isPlayer1) {
         auto& st = BufferState::get();
 
-        // Simulación, modo apagado o nosotros mismos soltando la cola -> comportamiento normal
         if (st.isSimulating || st.isFlushing || !st.isEnabled()) {
             GJBaseGameLayer::handleButton(isDown, button, isPlayer1);
             return;
         }
 
-        // Si ya hay inputs pendientes, todo lo nuevo (press o release) va detrás
-        // para mantener el orden y no dejar el botón "pegado"
+        // Si ya hay algo pendiente, lo nuevo va detras para mantener el orden
         if (!st.queue.empty()) {
-            st.queue.push_back({ isDown, button, isPlayer1, 0 });
+            st.queue.push_back({ isDown, button, isPlayer1, 0, 0 });
             return;
         }
 
-        PlayerObject* target = isPlayer1 ? m_player1 : m_player2;
+        if (isDown) {
+            PlayerObject* target = isPlayer1 ? m_player1 : m_player2;
+            int maxTicks = st.getMaxTicks();
 
-        // Press que mataría en este tick -> retrasar
-        if (isDown && testIfInputKills(target, true, button)) {
-            st.queue.push_back({ isDown, button, isPlayer1, 1 });
-            return;
+            // Buscamos el menor retraso d (0..max) con el que NO mueres
+            int safeDelay = -1;
+            for (int d = 0; d <= maxTicks; ++d) {
+                if (!simulateDies(target, d, button)) {
+                    safeDelay = d;
+                    break;
+                }
+            }
+
+            std::cout << "[InputBuffer][DEBUG] PRESS btn=" << button
+                      << " retraso_seguro=" << safeDelay
+                      << " (max " << maxTicks << ")"
+                      << " x=" << (target ? target->getPositionX() : -1.f)
+                      << " dt=" << st.stepDt << "\n" << std::flush;
+
+            if (safeDelay > 0) {
+                float ms = safeDelay * (1000.0f / 240.0f);
+                std::cout << "[InputBuffer] SAVED: press retrasado " << safeDelay
+                          << " ticks (" << ms << " ms)\n" << std::flush;
+                st.queue.push_back({ isDown, button, isPlayer1, 0, safeDelay });
+                st.debugCalls = 0;
+                return;
+            }
+            // safeDelay == 0 -> ya es seguro ahora; -1 -> ningun retraso salva: no tocamos nada
         }
 
         GJBaseGameLayer::handleButton(isDown, button, isPlayer1);
     }
 
-    // Se llama una vez por tick de física (no una vez por frame)
-    // Firma de GD 2.2081: processCommands(float, bool, bool)
+    // GD 2.2081: se llama una vez por tick de fisica
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto& st = BufferState::get();
 
+        if (!st.isSimulating) st.stepDt = dt > 0.f ? dt : st.stepDt;
+
         if (st.isEnabled() && !st.queue.empty()) {
-            int maxTicks = st.getMaxTicks();
+            if (st.debugCalls < 12) {
+                std::cout << "[InputBuffer][DEBUG] processCommands dt=" << dt
+                          << " half=" << isHalfTick << " last=" << isLastTick
+                          << " cola=" << st.queue.size() << "\n" << std::flush;
+                st.debugCalls++;
+            }
 
             while (!st.queue.empty()) {
                 auto& pending = st.queue.front();
-                PlayerObject* target = pending.isPlayer1 ? m_player1 : m_player2;
 
-                bool release = !pending.isDown;
-                bool canFire = release;
-
-                if (!release) {
-                    bool stillKills = testIfInputKills(target, true, pending.button);
-                    canFire = !stillKills || pending.ticksDelayed >= maxTicks;
-                }
-
-                if (!canFire) {
-                    pending.ticksDelayed++;
-                    break; // el press sigue esperando; lo de detrás también
-                }
-
-                if (!release && pending.ticksDelayed > 0) {
-                    st.logSavedInput(pending.ticksDelayed);
+                if (pending.isDown) {
+                    pending.ticksWaited++;
+                    if (pending.ticksWaited < pending.delayTarget) break; // aun toca esperar
                 }
 
                 PendingInput p = pending;
@@ -261,7 +275,6 @@ class $modify(PredictivePlayLayer, PlayLayer) {
     }
 };
 
-// F6 para ciclar el modo
 class $modify(BufferKeyboardHook, CCKeyboardDispatcher) {
     bool dispatchKeyboardMSG(enumKeyCodes key, bool isKeyDown, bool isKeyRepeat, double timestamp) {
         if (isKeyDown && !isKeyRepeat && key == enumKeyCodes::KEY_F6) {

@@ -1,100 +1,219 @@
-/**
- * Include the Geode headers.
- */
 #include <Geode/Geode.hpp>
+#include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/CCKeyboardDispatcher.hpp>
+#include <deque>
+#include <iostream>
+#ifdef GEODE_IS_WINDOWS
+#include <windows.h>
+#include <io.h>
+#include <fcntl.h>
+#endif
 
-/**
- * Brings cocos2d and all Geode namespaces to the current scope.
- */
 using namespace geode::prelude;
 
-/**
- * `$modify` lets you extend and modify GD's classes.
- * To hook a function in Geode, simply $modify the class
- * and write a new function definition with the signature of
- * the function you want to hook.
- *
- * Here we use the overloaded `$modify` macro to set our own class name,
- * so that we can use it for button callbacks.
- *
- * Notice the header being included, you *must* include the header for
- * the class you are modifying, or you will get a compile error.
- *
- * Another way you could do this is like this:
- *
- * struct MyMenuLayer : Modify<MyMenuLayer, MenuLayer> {};
- */
-#include <Geode/modify/MenuLayer.hpp>
-class $modify(MyMenuLayer, MenuLayer) {
-	/**
-	 * Typically classes in GD are initialized using the `init` function, (though not always!),
-	 * so here we use it to add our own button to the bottom menu.
-	 *
-	 * Note that for all hooks, your signature has to *match exactly*,
-	 * `void init()` would not place a hook!
-	*/
-	bool init() {
-		/**
-		 * We call the original init function so that the
-		 * original class is properly initialized.
-		 */
-		if (!MenuLayer::init()) {
-			return false;
-		}
+enum BufferStage {
+    STAGE_OFF = 0,
+    STAGE_2_TICKS = 1,
+    STAGE_4_TICKS = 2,
+    STAGE_8_TICKS = 3
+};
 
-		/**
-		 * You can use methods from the `geode::log` namespace to log messages to the console,
-		 * being useful for debugging and such. See this page for more info about logging:
-		 * https://docs.geode-sdk.org/tutorials/logging
-		*/
-		log::debug("Hello from my MenuLayer::init hook! This layer has {} children.", this->getChildrenCount());
+class ConsoleManager {
+public:
+    static ConsoleManager& get() {
+        static ConsoleManager instance;
+        return instance;
+    }
 
-		/**
-		 * See this page for more info about buttons
-		 * https://docs.geode-sdk.org/tutorials/buttons
-		*/
-		auto myButton = CCMenuItemSpriteExtra::create(
-			CCSprite::createWithSpriteFrameName("GJ_likeBtn_001.png"),
-			this,
-			/**
-			 * Here we use the name we set earlier for our modify class.
-			*/
-			menu_selector(MyMenuLayer::onMyButton)
-		);
+    void initConsole() {
+#ifdef GEODE_IS_WINDOWS
+        if (m_initialized) return;
+        
+        AllocConsole();
+        SetConsoleTitleA("Dynamic Prediction Input Buffer - Live Console");
 
-		/**
-		 * Here we access the `bottom-menu` node by its ID, and add our button to it.
-		 * Node IDs are a Geode feature, see this page for more info about it:
-		 * https://docs.geode-sdk.org/tutorials/nodetree
-		*/
-		auto menu = this->getChildByID("bottom-menu");
-		menu->addChild(myButton);
+        FILE* fp;
+        freopen_s(&fp, "CONOUT$", "w", stdout);
+        freopen_s(&fp, "CONOUT$", "w", stderr);
+        freopen_s(&fp, "CONIN$", "r", stdin);
 
-		/**
-		 * The `_spr` string literal operator just prefixes the string with
-		 * your mod id followed by a slash. This is good practice for setting your own node ids.
-		*/
-		myButton->setID("my-button"_spr);
+        std::cout << "========================================================\n";
+        std::cout << "[InputBuffer] LOADED (Lookahead Trajectory Console)\n";
+        std::cout << "[InputBuffer] Default Mode: STAGE 1 (2 Ticks / ~8.3ms)\n";
+        std::cout << "[InputBuffer] Presiona F6 para cambiar: OFF -> 2T -> 4T -> 8T\n";
+        std::cout << "========================================================\n\n";
 
-		/**
-		 * We update the layout of the menu to ensure that our button is properly placed.
-		 * This is yet another Geode feature, see this page for more info about it:
-		 * https://docs.geode-sdk.org/tutorials/layouts
-		*/
-		menu->updateLayout();
+        m_initialized = true;
+#endif
+    }
 
-		/**
-		 * We return `true` to indicate that the class was properly initialized.
-		 */
-		return true;
-	}
+    void cycleMode() {
+        m_currentStage = static_cast<BufferStage>((m_currentStage + 1) % 4);
+        printStatus();
+    }
 
-	/**
-	 * This is the callback function for the button we created earlier.
-	 * The signature for button callbacks must always be the same,
-	 * return type `void` and taking a `CCObject*`.
-	*/
-	void onMyButton(CCObject*) {
-		FLAlertLayer::create("Geode", "Hello from my custom mod!", "OK")->show();
-	}
+    int getMaxTicks() const {
+        switch (m_currentStage) {
+            case STAGE_2_TICKS: return 2;
+            case STAGE_4_TICKS: return 4;
+            case STAGE_8_TICKS: return 8;
+            case STAGE_OFF:
+            default: return 0;
+        }
+    }
+
+    bool isEnabled() const {
+        return m_currentStage != STAGE_OFF;
+    }
+
+    void logSavedInput(int ticksDelayed, bool isPress) {
+        float msSaved = ticksDelayed * (1000.0f / 240.0f);
+        std::cout << "[InputBuffer] SAVED " << ticksDelayed << " TICKS (" 
+                  << msSaved << " ms) | " 
+                  << (isPress ? "PRESS" : "RELEASE") 
+                  << " delayed to avoid death\n";
+    }
+
+private:
+    bool m_initialized = false;
+    BufferStage m_currentStage = STAGE_2_TICKS;
+
+    void printStatus() {
+        std::cout << "[InputBuffer] F6 -> ";
+        switch (m_currentStage) {
+            case STAGE_OFF:
+                std::cout << "STAGE 0: OFF (Sin asistencia)\n";
+                break;
+            case STAGE_2_TICKS:
+                std::cout << "STAGE 1: 2 Ticks (~8.3 ms buffer)\n";
+                break;
+            case STAGE_4_TICKS:
+                std::cout << "STAGE 2: 4 Ticks (~16.6 ms buffer)\n";
+                break;
+            case STAGE_8_TICKS:
+                std::cout << "STAGE 3: 8 Ticks (~33.3 ms buffer)\n";
+                break;
+        }
+    }
+};
+
+struct DeferredInput {
+    bool isDown;
+    bool isPlayer2;
+    int ticksDelayed;
+};
+
+class $modify(LookaheadPlayLayer, PlayLayer) {
+    struct Fields {
+        std::deque<DeferredInput> pendingInputs;
+        bool isSimulating = false;
+    };
+
+    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
+        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
+        ConsoleManager::get().initConsole();
+        return true;
+    }
+
+    struct PlayerSnapshot {
+        cocos2d::CCPoint position;
+        double yVelocity;
+        double xVelocity;
+        float rotation;
+        bool isDead;
+        bool isOnGround;
+    };
+
+    PlayerSnapshot takeSnapshot(PlayerObject* player) {
+        return {
+            player->getPosition(),
+            player->m_yVelocity,
+            player->m_xVelocity,
+            player->getRotation(),
+            player->m_isDead,
+            player->m_isOnGround
+        };
+    }
+
+    void restoreSnapshot(PlayerObject* player, const PlayerSnapshot& snap) {
+        player->setPosition(snap.position);
+        player->m_yVelocity = snap.yVelocity;
+        player->m_xVelocity = snap.xVelocity;
+        player->setRotation(snap.rotation);
+        player->m_isDead = snap.isDead;
+        player->m_isOnGround = snap.isOnGround;
+    }
+
+    bool wouldInputKill(PlayerObject* player, bool isDown, float dt) {
+        if (!player || player->m_isDead) return false;
+
+        PlayerSnapshot snap = takeSnapshot(player);
+        m_fields->isSimulating = true;
+
+        if (isDown) {
+            player->pushButton(PlayerButton::Jump);
+        }
+
+        player->update(dt);
+        bool died = player->m_isDead;
+
+        restoreSnapshot(player, snap);
+        m_fields->isSimulating = false;
+
+        return died;
+    }
+
+    void pushButton(int state, bool isPlayer2) {
+        if (m_fields->isSimulating || !ConsoleManager::get().isEnabled()) {
+            PlayLayer::pushButton(state, isPlayer2);
+            return;
+        }
+
+        PlayerObject* target = isPlayer2 ? m_player2 : m_player1;
+        float stepDt = 1.0f / 240.0f;
+
+        if (wouldInputKill(target, true, stepDt)) {
+            m_fields->pendingInputs.push_back({ true, isPlayer2, 0 });
+            return;
+        }
+
+        PlayLayer::pushButton(state, isPlayer2);
+    }
+
+    void update(float dt) {
+        if (ConsoleManager::get().isEnabled() && !m_fields->pendingInputs.empty()) {
+            auto& nextInput = m_fields->pendingInputs.front();
+            PlayerObject* target = nextInput.isPlayer2 ? m_player2 : m_player1;
+            int maxTicks = ConsoleManager::get().getMaxTicks();
+
+            if (!wouldInputKill(target, nextInput.isDown, dt) || nextInput.ticksDelayed >= maxTicks) {
+                if (nextInput.ticksDelayed > 0) {
+                    ConsoleManager::get().logSavedInput(nextInput.ticksDelayed, nextInput.isDown);
+                }
+                PlayLayer::pushButton(0, !nextInput.isPlayer2);
+                m_fields->pendingInputs.pop_front();
+            } else {
+                nextInput.ticksDelayed++;
+            }
+        }
+
+        PlayLayer::update(dt);
+    }
+
+    void destroyPlayer(PlayerObject* player, GameObject* object) {
+        if (m_fields && m_fields->isSimulating) {
+            player->m_isDead = true;
+            return;
+        }
+        PlayLayer::destroyPlayer(player, object);
+    }
+};
+
+class $modify(BufferKeyboardHook, CCKeyboardDispatcher) {
+    bool dispatchKeyboardMSG(enumKeyCodes key, bool isKeyDown, bool isKeyRepeat) {
+        if (isKeyDown && !isKeyRepeat && key == enumKeyCodes::KEY_F6) {
+            ConsoleManager::get().cycleMode();
+        }
+        return CCKeyboardDispatcher::dispatchKeyboardMSG(key, isKeyDown, isKeyRepeat);
+    }
 };

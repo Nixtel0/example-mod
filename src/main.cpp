@@ -144,10 +144,6 @@ class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
         cp->retain();
         player->saveToCheckpoint(cp);
 
-        // Guardamos también el estado de pulsación, que el checkpoint no siempre cubre
-        bool savedHolding = player->m_isHolding;
-        bool savedQueuedHold = player->m_hasJustHeld;
-
         st.isSimulating = true;
         st.simulationDied = false;
 
@@ -164,8 +160,6 @@ class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
         st.isSimulating = false;
         st.simulationDied = false;
         player->loadFromCheckpoint(cp);
-        player->m_isHolding = savedHolding;
-        player->m_hasJustHeld = savedQueuedHold;
         player->m_isDead = false;
 
         cp->release();
@@ -200,9 +194,8 @@ class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
     }
 
     // Se llama una vez por tick de física (no una vez por frame)
-    // NOTA: en algunas versiones la firma es processCommands(float, bool, bool).
-    // Si no compila, ajústala a la de tu binding de Geode.
-    void processCommands(float dt) {
+    // Firma de GD 2.2081: processCommands(float, bool, bool)
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto& st = BufferState::get();
 
         if (st.isEnabled() && !st.queue.empty()) {
@@ -238,7 +231,7 @@ class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
             }
         }
 
-        GJBaseGameLayer::processCommands(dt);
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
     }
 };
 

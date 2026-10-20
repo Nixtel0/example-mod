@@ -21,17 +21,25 @@ enum BufferStage {
     STAGE_8_TICKS = 3
 };
 
-class ConsoleManager {
+struct PendingInput {
+    bool isDown;
+    int button;
+    bool isPlayer1;
+    int ticksDelayed;
+};
+
+// Estado global del mod (modo, consola, cola de inputs y flags de simulación)
+class BufferState {
 public:
-    static ConsoleManager& get() {
-        static ConsoleManager instance;
+    static BufferState& get() {
+        static BufferState instance;
         return instance;
     }
 
     void initConsole() {
 #ifdef GEODE_IS_WINDOWS
         if (m_initialized) return;
-        
+
         AllocConsole();
         SetConsoleTitleA("Dynamic Prediction Input Buffer - Live Console");
 
@@ -42,215 +50,229 @@ public:
 
         std::cout << "========================================================\n";
         std::cout << "[InputBuffer] LOADED - Lookahead Prediction Engine Active\n";
-        std::cout << "[InputBuffer] Initial Mode: STAGE 1 (2 Ticks / ~8.3ms)\n";
         std::cout << "[InputBuffer] Presiona F6 para ciclar: OFF -> 2T -> 4T -> 8T\n";
         std::cout << "========================================================\n\n";
         std::cout << std::flush;
 
         m_initialized = true;
 #endif
+        // Restaurar el modo guardado la primera vez
+        if (!m_loaded) {
+            m_loaded = true;
+            int saved = Mod::get()->getSavedValue<int>("stage", static_cast<int>(STAGE_2_TICKS));
+            if (saved < 0 || saved > 3) saved = static_cast<int>(STAGE_2_TICKS);
+            m_stage = static_cast<BufferStage>(saved);
+            printStatus();
+        }
     }
 
     void cycleMode() {
-        m_currentStage = static_cast<BufferStage>((m_currentStage + 1) % 4);
+        m_stage = static_cast<BufferStage>((m_stage + 1) % 4);
+        Mod::get()->setSavedValue<int>("stage", static_cast<int>(m_stage));
+        if (m_stage == STAGE_OFF) queue.clear(); // al apagar, no dejamos inputs colgados
         printStatus();
     }
 
     int getMaxTicks() const {
-        switch (m_currentStage) {
+        switch (m_stage) {
             case STAGE_2_TICKS: return 2;
             case STAGE_4_TICKS: return 4;
             case STAGE_8_TICKS: return 8;
-            case STAGE_OFF:
             default: return 0;
         }
     }
 
-    bool isEnabled() const {
-        return m_currentStage != STAGE_OFF;
-    }
+    bool isEnabled() const { return m_stage != STAGE_OFF; }
 
-    void logSavedInput(int ticksDelayed, bool isPress) {
+    void logSavedInput(int ticksDelayed) {
         float msSaved = ticksDelayed * (1000.0f / 240.0f);
-        std::cout << "[InputBuffer] SAVED " << ticksDelayed << " TICKS (" 
-                  << msSaved << " ms) | " 
-                  << (isPress ? "PRESS" : "RELEASE") 
-                  << " delayed to avoid death\n" << std::flush;
+        std::cout << "[InputBuffer] SAVED: press retrasado " << ticksDelayed
+                  << " ticks (" << msSaved << " ms) para evitar muerte\n" << std::flush;
+        log::info("InputBuffer: press retrasado {} ticks ({} ms)", ticksDelayed, msSaved);
     }
 
-    // Bandera global para saber si estamos ejecutando una micro-simulación
+    // Cola de inputs pendientes (en orden de llegada)
+    std::deque<PendingInput> queue;
+
+    // true mientras estamos en una micro-simulación
     bool isSimulating = false;
     bool simulationDied = false;
 
+    // true mientras soltamos nosotros un input de la cola (evita reentrada en handleButton)
+    bool isFlushing = false;
+
 private:
     bool m_initialized = false;
-    BufferStage m_currentStage = STAGE_2_TICKS;
+    bool m_loaded = false;
+    BufferStage m_stage = STAGE_2_TICKS;
 
     void printStatus() {
         std::cout << "[InputBuffer] F6 -> ";
-        switch (m_currentStage) {
-            case STAGE_OFF:
-                std::cout << "STAGE 0: OFF (Sin asistencia)\n";
-                break;
-            case STAGE_2_TICKS:
-                std::cout << "STAGE 1: 2 Ticks (~8.3 ms buffer)\n";
-                break;
-            case STAGE_4_TICKS:
-                std::cout << "STAGE 2: 4 Ticks (~16.6 ms buffer)\n";
-                break;
-            case STAGE_8_TICKS:
-                std::cout << "STAGE 3: 8 Ticks (~33.3 ms buffer)\n";
-                break;
+        switch (m_stage) {
+            case STAGE_OFF:      std::cout << "STAGE 0: OFF\n"; break;
+            case STAGE_2_TICKS:  std::cout << "STAGE 1: 2 Ticks (~8.3 ms)\n"; break;
+            case STAGE_4_TICKS:  std::cout << "STAGE 2: 4 Ticks (~16.6 ms)\n"; break;
+            case STAGE_8_TICKS:  std::cout << "STAGE 3: 8 Ticks (~33.3 ms)\n"; break;
         }
         std::cout << std::flush;
     }
 };
 
-struct PendingInput {
-    bool isDown;
-    int button;
-    bool isPlayer1;
-    int ticksDelayed;
-};
-
-// Hook sobre PlayerObject para evitar que muera visual/físicamente durante la predicción
+// Evita que la simulación mate al jugador de verdad
 class $modify(PredictivePlayerObject, PlayerObject) {
     void playerDestroyed(bool p0) {
-        if (ConsoleManager::get().isSimulating) {
-            ConsoleManager::get().simulationDied = true;
+        if (BufferState::get().isSimulating) {
+            BufferState::get().simulationDied = true;
             return;
         }
         PlayerObject::playerDestroyed(p0);
     }
 };
 
-// Hook principal de físicas y gestión de inputs
 class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
-    struct Fields {
-        std::deque<PendingInput> queue;
-    };
 
-    struct FullPlayerState {
-        cocos2d::CCPoint pos;
-        double yVel;
-        float rot;
-        bool isDead;
-        bool isOnGround;
-        bool isDashing;
-    };
-
-    FullPlayerState capturePlayerState(PlayerObject* p) {
-        return {
-            p->getPosition(),
-            p->m_yVelocity,
-            p->getRotation(),
-            p->m_isDead,
-            p->m_isOnGround,
-            p->m_isDashing
-        };
-    }
-
-    void restorePlayerState(PlayerObject* p, const FullPlayerState& s) {
-        p->setPosition(s.pos);
-        p->m_yVelocity = s.yVel;
-        p->setRotation(s.rot);
-        p->m_isDead = s.isDead;
-        p->m_isOnGround = s.isOnGround;
-        p->m_isDashing = s.isDashing;
-    }
-
+    // Simula 1 tick con el input aplicado y devuelve true si el jugador moriría.
+    // Usa un PlayerCheckpoint completo (el mismo que usan los checkpoints del juego)
+    // en vez de copiar campos a mano.
     bool testIfInputKills(PlayerObject* player, bool isDown, int button) {
         if (!player || player->m_isDead) return false;
 
-        FullPlayerState state = capturePlayerState(player);
-        ConsoleManager::get().isSimulating = true;
-        ConsoleManager::get().simulationDied = false;
+        auto& st = BufferState::get();
 
-        // 1. Aplicamos el salto tentativo
-        if (isDown) {
-            player->pushButton(static_cast<PlayerButton>(button));
-        } else {
-            player->releaseButton(static_cast<PlayerButton>(button));
-        }
+        auto* cp = PlayerCheckpoint::create();
+        if (!cp) return false;
+        cp->retain();
+        player->saveToCheckpoint(cp);
 
-        // 2. Evaluamos la física y colisiones reales con los 3 argumentos requeridos
-        float stepDt = 1.0f / 240.0f;
+        // Guardamos también el estado de pulsación, que el checkpoint no siempre cubre
+        bool savedHolding = player->m_isHolding;
+        bool savedQueuedHold = player->m_hasJustHeld;
+
+        st.isSimulating = true;
+        st.simulationDied = false;
+
+        if (isDown) player->pushButton(static_cast<PlayerButton>(button));
+        else player->releaseButton(static_cast<PlayerButton>(button));
+
+        const float stepDt = 1.0f / 240.0f;
         player->update(stepDt);
         this->checkCollisions(player, stepDt, false);
 
-        bool wouldDie = ConsoleManager::get().simulationDied || player->m_isDead;
+        bool wouldDie = st.simulationDied || player->m_isDead;
 
-        // 3. Restauramos el estado del jugador intacto
-        restorePlayerState(player, state);
-        ConsoleManager::get().isSimulating = false;
-        ConsoleManager::get().simulationDied = false;
+        // Restaurar todo
+        st.isSimulating = false;
+        st.simulationDied = false;
+        player->loadFromCheckpoint(cp);
+        player->m_isHolding = savedHolding;
+        player->m_hasJustHeld = savedQueuedHold;
+        player->m_isDead = false;
 
+        cp->release();
         return wouldDie;
     }
 
     void handleButton(bool isDown, int button, bool isPlayer1) {
-        if (ConsoleManager::get().isSimulating || !ConsoleManager::get().isEnabled()) {
+        auto& st = BufferState::get();
+
+        // Simulación, modo apagado o nosotros mismos soltando la cola -> comportamiento normal
+        if (st.isSimulating || st.isFlushing || !st.isEnabled()) {
             GJBaseGameLayer::handleButton(isDown, button, isPlayer1);
+            return;
+        }
+
+        // Si ya hay inputs pendientes, todo lo nuevo (press o release) va detrás
+        // para mantener el orden y no dejar el botón "pegado"
+        if (!st.queue.empty()) {
+            st.queue.push_back({ isDown, button, isPlayer1, 0 });
             return;
         }
 
         PlayerObject* target = isPlayer1 ? m_player1 : m_player2;
 
-        // Si es una pulsación y detecta que el salto en este tick mataría:
+        // Press que mataría en este tick -> retrasar
         if (isDown && testIfInputKills(target, true, button)) {
-            m_fields->queue.push_back({ isDown, button, isPlayer1, 1 });
+            st.queue.push_back({ isDown, button, isPlayer1, 1 });
             return;
         }
 
         GJBaseGameLayer::handleButton(isDown, button, isPlayer1);
     }
 
-    void update(float dt) {
-        if (ConsoleManager::get().isEnabled() && !m_fields->queue.empty()) {
-            auto& pending = m_fields->queue.front();
-            PlayerObject* target = pending.isPlayer1 ? m_player1 : m_player2;
-            int maxTicks = ConsoleManager::get().getMaxTicks();
+    // Se llama una vez por tick de física (no una vez por frame)
+    // NOTA: en algunas versiones la firma es processCommands(float, bool, bool).
+    // Si no compila, ajústala a la de tu binding de Geode.
+    void processCommands(float dt) {
+        auto& st = BufferState::get();
 
-            // Comprobamos si en el tick actual ya es seguro saltar
-            bool stillKills = testIfInputKills(target, pending.isDown, pending.button);
+        if (st.isEnabled() && !st.queue.empty()) {
+            int maxTicks = st.getMaxTicks();
 
-            if (!stillKills || pending.ticksDelayed >= maxTicks) {
-                if (pending.ticksDelayed > 0) {
-                    ConsoleManager::get().logSavedInput(pending.ticksDelayed, pending.isDown);
+            while (!st.queue.empty()) {
+                auto& pending = st.queue.front();
+                PlayerObject* target = pending.isPlayer1 ? m_player1 : m_player2;
+
+                bool release = !pending.isDown;
+                bool canFire = release;
+
+                if (!release) {
+                    bool stillKills = testIfInputKills(target, true, pending.button);
+                    canFire = !stillKills || pending.ticksDelayed >= maxTicks;
                 }
-                GJBaseGameLayer::handleButton(pending.isDown, pending.button, pending.isPlayer1);
-                m_fields->queue.pop_front();
-            } else {
-                pending.ticksDelayed++;
+
+                if (!canFire) {
+                    pending.ticksDelayed++;
+                    break; // el press sigue esperando; lo de detrás también
+                }
+
+                if (!release && pending.ticksDelayed > 0) {
+                    st.logSavedInput(pending.ticksDelayed);
+                }
+
+                PendingInput p = pending;
+                st.queue.pop_front();
+
+                st.isFlushing = true;
+                GJBaseGameLayer::handleButton(p.isDown, p.button, p.isPlayer1);
+                st.isFlushing = false;
             }
         }
 
-        GJBaseGameLayer::update(dt);
+        GJBaseGameLayer::processCommands(dt);
     }
 };
 
-// Hook en PlayLayer para inicializar la consola y proteger destroyPlayer
 class $modify(PredictivePlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
-        ConsoleManager::get().initConsole();
+        BufferState::get().initConsole();
+        BufferState::get().queue.clear();
         return true;
     }
 
+    void resetLevel() {
+        auto& st = BufferState::get();
+        st.queue.clear();
+        st.isSimulating = false;
+        st.simulationDied = false;
+        st.isFlushing = false;
+        PlayLayer::resetLevel();
+    }
+
     void destroyPlayer(PlayerObject* player, GameObject* object) {
-        if (ConsoleManager::get().isSimulating) {
-            ConsoleManager::get().simulationDied = true;
+        if (BufferState::get().isSimulating) {
+            BufferState::get().simulationDied = true;
             return;
         }
         PlayLayer::destroyPlayer(player, object);
     }
 };
 
-// Hook de teclado F6
+// F6 para ciclar el modo
 class $modify(BufferKeyboardHook, CCKeyboardDispatcher) {
     bool dispatchKeyboardMSG(enumKeyCodes key, bool isKeyDown, bool isKeyRepeat, double timestamp) {
         if (isKeyDown && !isKeyRepeat && key == enumKeyCodes::KEY_F6) {
-            ConsoleManager::get().cycleMode();
+            BufferState::get().cycleMode();
         }
         return CCKeyboardDispatcher::dispatchKeyboardMSG(key, isKeyDown, isKeyRepeat, timestamp);
     }

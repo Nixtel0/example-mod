@@ -14,15 +14,9 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Geode CLI
-        uses: geode-sdk/setup-geode@v3
-
-      - name: Build Mod
-        run: |
-          geode build --platform win
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+      - name: Build Mod with Geode Action
+        uses: geode-sdk/build-geode-mod@main
         with:
-          name: geode-mod-windows
-          path: build/*.geode
+          bindings: 'geode-sdk/bindings'
+          sdk: 'nightly'
+          combine: true

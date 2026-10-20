@@ -1,0 +1,28 @@
+name: Build Geode Mod
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Geode CLI
+        uses: geode-sdk/setup-geode@v3
+
+      - name: Build Mod
+        run: |
+          geode build --platform win
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: geode-mod-windows
+          path: build/*.geode

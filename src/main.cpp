@@ -1,6 +1,7 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/CCKeyboardDispatcher.hpp>
 #include <deque>
 #include <iostream>
@@ -77,6 +78,10 @@ public:
                   << " delayed to avoid death\n" << std::flush;
     }
 
+    // Bandera global para saber si estamos ejecutando una micro-simulación
+    bool isSimulating = false;
+    bool simulationDied = false;
+
 private:
     bool m_initialized = false;
     BufferStage m_currentStage = STAGE_2_TICKS;
@@ -108,14 +113,23 @@ struct PendingInput {
     int ticksDelayed;
 };
 
+// Hook sobre PlayerObject para evitar que muera visual/físicamente durante la predicción
+class $modify(PredictivePlayerObject, PlayerObject) {
+    void playerDestroyed(bool p0) {
+        if (ConsoleManager::get().isSimulating) {
+            ConsoleManager::get().simulationDied = true;
+            return;
+        }
+        PlayerObject::playerDestroyed(p0);
+    }
+};
+
+// Hook principal de físicas y gestión de inputs
 class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
     struct Fields {
         std::deque<PendingInput> queue;
-        bool isSimulatingDeath = false;
-        bool simulationDied = false;
     };
 
-    // Estructura de guardado para la simulacion predictiva
     struct FullPlayerState {
         cocos2d::CCPoint pos;
         double yVel;
@@ -145,48 +159,45 @@ class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
         p->m_isDashing = s.isDashing;
     }
 
-    // Comprueba si ejecutar el input en este momento resulta en muerte
     bool testIfInputKills(PlayerObject* player, bool isDown, int button) {
         if (!player || player->m_isDead) return false;
 
         FullPlayerState state = capturePlayerState(player);
-        m_fields->isSimulatingDeath = true;
-        m_fields->simulationDied = false;
+        ConsoleManager::get().isSimulating = true;
+        ConsoleManager::get().simulationDied = false;
 
-        // 1. Inyectamos la acción en el PlayerObject
+        // 1. Aplicamos el salto tentativo
         if (isDown) {
             player->pushButton(static_cast<PlayerButton>(button));
         } else {
             player->releaseButton(static_cast<PlayerButton>(button));
         }
 
-        // 2. Ejecutamos un tick de fisicas y su chequeo de colisiones completo
+        // 2. Evaluamos la física y colisiones reales con los 3 argumentos requeridos
         float stepDt = 1.0f / 240.0f;
         player->update(stepDt);
-        this->checkCollisions(player, stepDt);
+        this->checkCollisions(player, stepDt, false);
 
-        bool wouldDie = m_fields->simulationDied || player->m_isDead;
+        bool wouldDie = ConsoleManager::get().simulationDied || player->m_isDead;
 
-        // 3. Restauramos de inmediato el estado
+        // 3. Restauramos el estado del jugador intacto
         restorePlayerState(player, state);
-        m_fields->isSimulatingDeath = false;
-        m_fields->simulationDied = false;
+        ConsoleManager::get().isSimulating = false;
+        ConsoleManager::get().simulationDied = false;
 
         return wouldDie;
     }
 
     void handleButton(bool isDown, int button, bool isPlayer1) {
-        // Si estamos simulando o el mod está apagado, ejecución nativa normal
-        if (m_fields->isSimulatingDeath || !ConsoleManager::get().isEnabled()) {
+        if (ConsoleManager::get().isSimulating || !ConsoleManager::get().isEnabled()) {
             GJBaseGameLayer::handleButton(isDown, button, isPlayer1);
             return;
         }
 
         PlayerObject* target = isPlayer1 ? m_player1 : m_player2;
 
-        // Si es una pulsación y detectamos que en este tick causa la muerte:
+        // Si es una pulsación y detecta que el salto en este tick mataría:
         if (isDown && testIfInputKills(target, true, button)) {
-            // RETRASAR EL SALTO: Encolamos para el siguiente tick
             m_fields->queue.push_back({ isDown, button, isPlayer1, 1 });
             return;
         }
@@ -195,47 +206,47 @@ class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
     }
 
     void update(float dt) {
-        // En cada tick de fisicas evaluamos si el input encolado ya es seguro ejecutarlo
         if (ConsoleManager::get().isEnabled() && !m_fields->queue.empty()) {
             auto& pending = m_fields->queue.front();
             PlayerObject* target = pending.isPlayer1 ? m_player1 : m_player2;
             int maxTicks = ConsoleManager::get().getMaxTicks();
 
-            // Comprobamos si en este nuevo tick ya no muere
+            // Comprobamos si en el tick actual ya es seguro saltar
             bool stillKills = testIfInputKills(target, pending.isDown, pending.button);
 
             if (!stillKills || pending.ticksDelayed >= maxTicks) {
-                // Si ya no muere o se alcanzó el límite máximo de ticks de gracia:
-                ConsoleManager::get().logSavedInput(pending.ticksDelayed, pending.isDown);
+                if (pending.ticksDelayed > 0) {
+                    ConsoleManager::get().logSavedInput(pending.ticksDelayed, pending.isDown);
+                }
                 GJBaseGameLayer::handleButton(pending.isDown, pending.button, pending.isPlayer1);
                 m_fields->queue.pop_front();
             } else {
-                // Sigue en peligro: retrasamos un tick adicional
                 pending.ticksDelayed++;
             }
         }
 
         GJBaseGameLayer::update(dt);
     }
-
-    // Interceptamos la llamada de muerte para que la simulación no mate al jugador real
-    void destroyPlayer(PlayerObject* player, GameObject* object) {
-        if (m_fields->isSimulatingDeath) {
-            m_fields->simulationDied = true;
-            return;
-        }
-        GJBaseGameLayer::destroyPlayer(player, object);
-    }
 };
 
+// Hook en PlayLayer para inicializar la consola y proteger destroyPlayer
 class $modify(PredictivePlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
         ConsoleManager::get().initConsole();
         return true;
     }
+
+    void destroyPlayer(PlayerObject* player, GameObject* object) {
+        if (ConsoleManager::get().isSimulating) {
+            ConsoleManager::get().simulationDied = true;
+            return;
+        }
+        PlayLayer::destroyPlayer(player, object);
+    }
 };
 
+// Hook de teclado F6
 class $modify(BufferKeyboardHook, CCKeyboardDispatcher) {
     bool dispatchKeyboardMSG(enumKeyCodes key, bool isKeyDown, bool isKeyRepeat, double timestamp) {
         if (isKeyDown && !isKeyRepeat && key == enumKeyCodes::KEY_F6) {

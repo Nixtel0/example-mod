@@ -6,6 +6,7 @@
 #include <deque>
 #include <vector>
 #include <cmath>
+#include <algorithm>
 #include <string>
 #include <iostream>
 
@@ -48,7 +49,9 @@ struct PendingInput {
     bool isPlayer1;
     int ticksWaited;   // ticks esperados hasta ahora
     int delayTarget;   // retraso fijo (predictor). Ignorado si learned == true
-    bool learned;      // true: esperar hasta que la X actual deje de estar marcada como "mortal"
+    bool learned;      // true: esperar hasta la X objetivo / hasta que la X deje de ser "mortal"
+    float targetX;     // X del tick seguro (ventana aprendida). -1 si no hay
+    float startX;      // X donde se pulso originalmente
 };
 
 class BufferState {
@@ -144,6 +147,8 @@ public:
 
     void clearLearned() {
         badX.clear();
+        windows.clear();
+        confirm.valid = false;
         lastPressValid = false;
         std::cout << "[InputBuffer] F10 -> olvidado todo lo aprendido\n" << std::flush;
     }
@@ -152,6 +157,43 @@ public:
         lastPressValid = true;
         lastPressX = x;
         lastPressTick = tickCounter;
+    }
+
+    // --- Ventanas aprendidas: todo click en [xLow, xSafe) se retrasa hasta xSafe ---
+    struct SafeWindow { float xLow; float xSafe; };
+    struct PendingConfirm {
+        bool valid = false;
+        float xSafe = 0.f;
+        float dx = 0.f;       // X que avanza por tick
+        int firedTick = 0;
+        int maxTicks = 0;
+    };
+
+    std::vector<SafeWindow> windows;
+    PendingConfirm confirm;
+
+    const SafeWindow* findWindow(float x) const {
+        for (auto const& w : windows) {
+            if (x >= w.xLow - SAME_TICK_TOLERANCE && x < w.xSafe - SAME_TICK_TOLERANCE) return &w;
+        }
+        return nullptr;
+    }
+
+    void addWindow(float xLow, float xSafe) {
+        for (auto& w : windows) {
+            if (std::fabs(w.xSafe - xSafe) < SAME_TICK_TOLERANCE) {
+                w.xLow = std::min(w.xLow, xLow);
+                return;
+            }
+        }
+        windows.push_back({ xLow, xSafe });
+    }
+
+    void removeWindowsAt(float xSafe) {
+        windows.erase(
+            std::remove_if(windows.begin(), windows.end(),
+                [&](const SafeWindow& w) { return std::fabs(w.xSafe - xSafe) < SAME_TICK_TOLERANCE; }),
+            windows.end());
     }
 
     // Estado
@@ -264,7 +306,7 @@ class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
 
         // Si ya hay algo pendiente, lo nuevo va detras para mantener el orden
         if (!st.queue.empty()) {
-            st.queue.push_back({ isDown, button, isPlayer1, 0, 0, false });
+            st.queue.push_back({ isDown, button, isPlayer1, 0, 0, false, -1.f, 0.f });
             return;
         }
 
@@ -303,14 +345,18 @@ class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
             if (safeDelay > 0) {
                 std::cout << "[InputBuffer] CLICK RETENIDO en x=" << x
                           << " [predictor] (retraso previsto " << safeDelay << " ticks)\n" << std::flush;
-                st.queue.push_back({ isDown, button, isPlayer1, 0, safeDelay, false });
+                st.queue.push_back({ isDown, button, isPlayer1, 0, safeDelay, false, -1.f, x });
                 st.debugCalls = 0;
                 return;
             }
-            if (learnedBad) {
+            // 3) Ventana aprendida: este click cae antes de un tick seguro conocido
+            const auto* win = st.findWindow(x);
+            if (win || learnedBad) {
+                float targetX = win ? win->xSafe : -1.f;
                 std::cout << "[InputBuffer] CLICK RETENIDO en x=" << x
-                          << " [aprendido] (esa posicion te mato antes)\n" << std::flush;
-                st.queue.push_back({ isDown, button, isPlayer1, 0, 0, true });
+                          << (win ? " [ventana] (hay un tick seguro conocido mas adelante)"
+                                  : " [aprendido] (esa posicion te mato antes)") << "\n" << std::flush;
+                st.queue.push_back({ isDown, button, isPlayer1, 0, 0, true, targetX, x });
                 st.debugCalls = 0;
                 return;
             }
@@ -329,6 +375,17 @@ class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
         if (!st.isSimulating) {
             st.stepDt = dt > 0.f ? dt : st.stepDt;
             st.tickCounter++;
+
+            // Si el click retrasado sobrevivio el tiempo suficiente, el tick donde se solto
+            // era el bueno: todos los ticks anteriores (hasta el maximo del modo) apuntan a el
+            if (st.confirm.valid && st.tickCounter - st.confirm.firedTick > st.lookahead) {
+                float xLow = st.confirm.xSafe - st.confirm.maxTicks * st.confirm.dx - SAME_TICK_TOLERANCE;
+                st.addWindow(xLow, st.confirm.xSafe);
+                std::cout << "[InputBuffer] Aprendido: tick seguro en x=" << st.confirm.xSafe
+                          << " -> cualquier click en los " << st.confirm.maxTicks
+                          << " ticks anteriores se retrasara hasta ahi\n" << std::flush;
+                st.confirm.valid = false;
+            }
         }
 
         if (st.isEnabled() && !st.queue.empty()) {
@@ -348,7 +405,9 @@ class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
                     if (pending.learned) {
                         // Esperar mientras esta X siga marcada como mortal (hasta el maximo del modo)
                         float x = m_player1 ? m_player1->getPositionX() : 0.f;
-                        if (st.isBadX(x) && pending.ticksWaited < st.getMaxTicks()) break;
+                        bool waitTarget = pending.targetX >= 0.f && x < pending.targetX - SAME_TICK_TOLERANCE;
+                        bool waitBad = st.isBadX(x);
+                        if ((waitTarget || waitBad) && pending.ticksWaited < st.getMaxTicks()) break;
                     } else {
                         if (pending.ticksWaited < pending.delayTarget) break;
                     }
@@ -358,12 +417,23 @@ class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
                 st.queue.pop_front();
 
                 if (p.isDown && p.isPlayer1 && m_player1) {
-                    st.recordPress(m_player1->getPositionX());
+                    const float fx = m_player1->getPositionX();
+                    st.recordPress(fx);
                     if (p.ticksWaited > 0) {
                         float ms = p.ticksWaited * (1000.0f / 240.0f);
-                        std::cout << "[InputBuffer] CLICK DEVUELTO AL JUEGO en x=" << m_player1->getPositionX()
+                        std::cout << "[InputBuffer] CLICK DEVUELTO AL JUEGO en x=" << fx
                                   << " tras " << p.ticksWaited << " ticks (" << ms << " ms)"
-                                  << (p.learned ? " [aprendido]" : " [predictor]") << "\n" << std::flush;
+                                  << (p.targetX >= 0.f ? " [ventana]" : (p.learned ? " [aprendido]" : " [predictor]"))
+                                  << "\n" << std::flush;
+
+                        // Pendiente de confirmar que sobrevives; si es asi se aprende la ventana
+                        float dx = (fx - p.startX) / static_cast<float>(p.ticksWaited);
+                        if (dx < 0.05f) dx = 1.3f;
+                        st.confirm.valid = true;
+                        st.confirm.xSafe = fx;
+                        st.confirm.dx = dx;
+                        st.confirm.firedTick = st.tickCounter;
+                        st.confirm.maxTicks = st.getMaxTicks();
                     }
                 }
 
@@ -389,6 +459,7 @@ class $modify(PredictivePlayLayer, PlayLayer) {
         std::string name = level ? std::string(level->m_levelName) : std::string();
         if (name != st.currentLevel) {
             st.badX.clear();
+            st.windows.clear();
             st.currentLevel = name;
         }
         return true;
@@ -401,6 +472,7 @@ class $modify(PredictivePlayLayer, PlayLayer) {
         st.simulationDied = false;
         st.isFlushing = false;
         st.lastPressValid = false;
+        st.confirm.valid = false;
         PlayLayer::resetLevel();
     }
 
@@ -413,10 +485,17 @@ class $modify(PredictivePlayLayer, PlayLayer) {
         }
 
         // Muerte real: si ocurrio poco despues de un click, ese click en esa X era mortal
+        if (st.isEnabled() && player == m_player1 && st.confirm.valid) {
+            // Moriste antes de confirmar: ese tick no era seguro
+            st.removeWindowsAt(st.confirm.xSafe);
+            st.confirm.valid = false;
+        }
+
         if (st.isEnabled() && player == m_player1 && st.lastPressValid) {
             int ticksSincePress = st.tickCounter - st.lastPressTick;
             if (ticksSincePress <= st.lookahead) {
                 st.addBadX(st.lastPressX);
+                st.removeWindowsAt(st.lastPressX); // si fue un tick "seguro" aprendido, ya no lo es
                 std::cout << "[InputBuffer] Aprendido: click en x=" << st.lastPressX
                           << " te mato " << ticksSincePress
                           << " ticks despues -> la proxima vez se retrasara\n" << std::flush;

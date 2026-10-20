@@ -40,10 +40,11 @@ public:
         freopen_s(&fp, "CONIN$", "r", stdin);
 
         std::cout << "========================================================\n";
-        std::cout << "[InputBuffer] LOADED (Lookahead Trajectory Console)\n";
-        std::cout << "[InputBuffer] Default Mode: STAGE 1 (2 Ticks / ~8.3ms)\n";
-        std::cout << "[InputBuffer] Presiona F6 para cambiar: OFF -> 2T -> 4T -> 8T\n";
+        std::cout << "[InputBuffer] LOADED - Lookahead Prediction Engine Active\n";
+        std::cout << "[InputBuffer] Initial Mode: STAGE 1 (2 Ticks / ~8.3ms)\n";
+        std::cout << "[InputBuffer] Presiona F6 para ciclar: OFF -> 2T -> 4T -> 8T\n";
         std::cout << "========================================================\n\n";
+        std::cout << std::flush;
 
         m_initialized = true;
 #endif
@@ -73,7 +74,7 @@ public:
         std::cout << "[InputBuffer] SAVED " << ticksDelayed << " TICKS (" 
                   << msSaved << " ms) | " 
                   << (isPress ? "PRESS" : "RELEASE") 
-                  << " delayed to avoid death\n";
+                  << " delayed to avoid death\n" << std::flush;
     }
 
 private:
@@ -96,79 +97,97 @@ private:
                 std::cout << "STAGE 3: 8 Ticks (~33.3 ms buffer)\n";
                 break;
         }
+        std::cout << std::flush;
     }
 };
 
-struct DeferredInput {
+struct PendingInput {
     bool isDown;
     int button;
     bool isPlayer1;
     int ticksDelayed;
 };
 
-// Hook principal de inputs en GJBaseGameLayer
-class $modify(LookaheadBaseGameLayer, GJBaseGameLayer) {
+class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
     struct Fields {
-        std::deque<DeferredInput> pendingInputs;
-        bool isSimulating = false;
+        std::deque<PendingInput> queue;
+        bool isSimulatingDeath = false;
+        bool simulationDied = false;
     };
 
-    struct PlayerSnapshot {
-        cocos2d::CCPoint position;
-        double yVelocity;
-        float rotation;
+    // Estructura de guardado para la simulacion predictiva
+    struct FullPlayerState {
+        cocos2d::CCPoint pos;
+        double yVel;
+        float rot;
         bool isDead;
         bool isOnGround;
+        bool isDashing;
     };
 
-    PlayerSnapshot takeSnapshot(PlayerObject* player) {
+    FullPlayerState capturePlayerState(PlayerObject* p) {
         return {
-            player->getPosition(),
-            player->m_yVelocity,
-            player->getRotation(),
-            player->m_isDead,
-            player->m_isOnGround
+            p->getPosition(),
+            p->m_yVelocity,
+            p->getRotation(),
+            p->m_isDead,
+            p->m_isOnGround,
+            p->m_isDashing
         };
     }
 
-    void restoreSnapshot(PlayerObject* player, const PlayerSnapshot& snap) {
-        player->setPosition(snap.position);
-        player->m_yVelocity = snap.yVelocity;
-        player->setRotation(snap.rotation);
-        player->m_isDead = snap.isDead;
-        player->m_isOnGround = snap.isOnGround;
+    void restorePlayerState(PlayerObject* p, const FullPlayerState& s) {
+        p->setPosition(s.pos);
+        p->m_yVelocity = s.yVel;
+        p->setRotation(s.rot);
+        p->m_isDead = s.isDead;
+        p->m_isOnGround = s.isOnGround;
+        p->m_isDashing = s.isDashing;
     }
 
-    bool wouldInputKill(PlayerObject* player, bool isDown, float dt) {
+    // Comprueba si ejecutar el input en este momento resulta en muerte
+    bool testIfInputKills(PlayerObject* player, bool isDown, int button) {
         if (!player || player->m_isDead) return false;
 
-        PlayerSnapshot snap = takeSnapshot(player);
-        m_fields->isSimulating = true;
+        FullPlayerState state = capturePlayerState(player);
+        m_fields->isSimulatingDeath = true;
+        m_fields->simulationDied = false;
 
+        // 1. Inyectamos la acción en el PlayerObject
         if (isDown) {
-            player->pushButton(PlayerButton::Jump);
+            player->pushButton(static_cast<PlayerButton>(button));
+        } else {
+            player->releaseButton(static_cast<PlayerButton>(button));
         }
 
-        player->update(dt);
-        bool died = player->m_isDead;
+        // 2. Ejecutamos un tick de fisicas y su chequeo de colisiones completo
+        float stepDt = 1.0f / 240.0f;
+        player->update(stepDt);
+        this->checkCollisions(player, stepDt);
 
-        restoreSnapshot(player, snap);
-        m_fields->isSimulating = false;
+        bool wouldDie = m_fields->simulationDied || player->m_isDead;
 
-        return died;
+        // 3. Restauramos de inmediato el estado
+        restorePlayerState(player, state);
+        m_fields->isSimulatingDeath = false;
+        m_fields->simulationDied = false;
+
+        return wouldDie;
     }
 
     void handleButton(bool isDown, int button, bool isPlayer1) {
-        if (m_fields->isSimulating || !ConsoleManager::get().isEnabled() || !isDown) {
+        // Si estamos simulando o el mod está apagado, ejecución nativa normal
+        if (m_fields->isSimulatingDeath || !ConsoleManager::get().isEnabled()) {
             GJBaseGameLayer::handleButton(isDown, button, isPlayer1);
             return;
         }
 
         PlayerObject* target = isPlayer1 ? m_player1 : m_player2;
-        float stepDt = 1.0f / 240.0f;
 
-        if (wouldInputKill(target, true, stepDt)) {
-            m_fields->pendingInputs.push_back({ isDown, button, isPlayer1, 0 });
+        // Si es una pulsación y detectamos que en este tick causa la muerte:
+        if (isDown && testIfInputKills(target, true, button)) {
+            // RETRASAR EL SALTO: Encolamos para el siguiente tick
+            m_fields->queue.push_back({ isDown, button, isPlayer1, 1 });
             return;
         }
 
@@ -176,28 +195,40 @@ class $modify(LookaheadBaseGameLayer, GJBaseGameLayer) {
     }
 
     void update(float dt) {
-        if (ConsoleManager::get().isEnabled() && !m_fields->pendingInputs.empty()) {
-            auto& nextInput = m_fields->pendingInputs.front();
-            PlayerObject* target = nextInput.isPlayer1 ? m_player1 : m_player2;
+        // En cada tick de fisicas evaluamos si el input encolado ya es seguro ejecutarlo
+        if (ConsoleManager::get().isEnabled() && !m_fields->queue.empty()) {
+            auto& pending = m_fields->queue.front();
+            PlayerObject* target = pending.isPlayer1 ? m_player1 : m_player2;
             int maxTicks = ConsoleManager::get().getMaxTicks();
 
-            if (!wouldInputKill(target, nextInput.isDown, dt) || nextInput.ticksDelayed >= maxTicks) {
-                if (nextInput.ticksDelayed > 0) {
-                    ConsoleManager::get().logSavedInput(nextInput.ticksDelayed, nextInput.isDown);
-                }
-                GJBaseGameLayer::handleButton(nextInput.isDown, nextInput.button, nextInput.isPlayer1);
-                m_fields->pendingInputs.pop_front();
+            // Comprobamos si en este nuevo tick ya no muere
+            bool stillKills = testIfInputKills(target, pending.isDown, pending.button);
+
+            if (!stillKills || pending.ticksDelayed >= maxTicks) {
+                // Si ya no muere o se alcanzó el límite máximo de ticks de gracia:
+                ConsoleManager::get().logSavedInput(pending.ticksDelayed, pending.isDown);
+                GJBaseGameLayer::handleButton(pending.isDown, pending.button, pending.isPlayer1);
+                m_fields->queue.pop_front();
             } else {
-                nextInput.ticksDelayed++;
+                // Sigue en peligro: retrasamos un tick adicional
+                pending.ticksDelayed++;
             }
         }
 
         GJBaseGameLayer::update(dt);
     }
+
+    // Interceptamos la llamada de muerte para que la simulación no mate al jugador real
+    void destroyPlayer(PlayerObject* player, GameObject* object) {
+        if (m_fields->isSimulatingDeath) {
+            m_fields->simulationDied = true;
+            return;
+        }
+        GJBaseGameLayer::destroyPlayer(player, object);
+    }
 };
 
-// Inicialización de consola al abrir nivel
-class $modify(LookaheadPlayLayer, PlayLayer) {
+class $modify(PredictivePlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
         ConsoleManager::get().initConsole();
@@ -205,7 +236,6 @@ class $modify(LookaheadPlayLayer, PlayLayer) {
     }
 };
 
-// Hook de la tecla F6
 class $modify(BufferKeyboardHook, CCKeyboardDispatcher) {
     bool dispatchKeyboardMSG(enumKeyCodes key, bool isKeyDown, bool isKeyRepeat, double timestamp) {
         if (isKeyDown && !isKeyRepeat && key == enumKeyCodes::KEY_F6) {

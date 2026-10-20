@@ -6,12 +6,9 @@
 		"mac": "2.2081",
 		"ios": "2.2081"
 	},
-	"id": "MOD_ID",
-	"name": "MOD_NAME",
-	"version": "MOD_VERSION",
-	"developer": "MOD_DEVELOPER",
-	"description": "MOD_DESCRIPTION",
-	"dependencies": {
-		"geode.node-ids": ">=v1.23.3"
-	}
+	"id": "nixtel0.predictive_delay_console",
+	"name": "Predictive Delay Buffer",
+	"version": "1.0.0",
+	"developer": "Nixtel0",
+	"description": "Buffer predictivo con consola externa para pruebas de colisiones y ticks."
 }

@@ -3,6 +3,7 @@
 #include <Geode/modify/CCKeyboardDispatcher.hpp>
 #include <deque>
 #include <iostream>
+
 #ifdef GEODE_IS_WINDOWS
 #include <windows.h>
 #include <io.h>
@@ -209,11 +210,12 @@ class $modify(LookaheadPlayLayer, PlayLayer) {
     }
 };
 
+// Firma actualizada a 4 parametros para compatibilidad con Geode v4/v5
 class $modify(BufferKeyboardHook, CCKeyboardDispatcher) {
-    bool dispatchKeyboardMSG(enumKeyCodes key, bool isKeyDown, bool isKeyRepeat) {
+    bool dispatchKeyboardMSG(enumKeyCodes key, bool isKeyDown, bool isKeyRepeat, double timestamp) {
         if (isKeyDown && !isKeyRepeat && key == enumKeyCodes::KEY_F6) {
             ConsoleManager::get().cycleMode();
         }
-        return CCKeyboardDispatcher::dispatchKeyboardMSG(key, isKeyDown, isKeyRepeat);
+        return CCKeyboardDispatcher::dispatchKeyboardMSG(key, isKeyDown, isKeyRepeat, timestamp);
     }
 };

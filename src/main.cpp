@@ -1,4 +1,5 @@
 #include <Geode/Geode.hpp>
+#include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/CCKeyboardDispatcher.hpp>
 #include <deque>
@@ -100,21 +101,17 @@ private:
 
 struct DeferredInput {
     bool isDown;
-    bool isPlayer2;
+    int button;
+    bool isPlayer1;
     int ticksDelayed;
 };
 
-class $modify(LookaheadPlayLayer, PlayLayer) {
+// Hook principal de inputs en GJBaseGameLayer
+class $modify(LookaheadBaseGameLayer, GJBaseGameLayer) {
     struct Fields {
         std::deque<DeferredInput> pendingInputs;
         bool isSimulating = false;
     };
-
-    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
-        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
-        ConsoleManager::get().initConsole();
-        return true;
-    }
 
     struct PlayerSnapshot {
         cocos2d::CCPoint position;
@@ -161,52 +158,54 @@ class $modify(LookaheadPlayLayer, PlayLayer) {
         return died;
     }
 
-    void pushButton(int state, bool isPlayer2) {
-        if (m_fields->isSimulating || !ConsoleManager::get().isEnabled()) {
-            GJBaseGameLayer::pushButton(state, isPlayer2);
+    void handleButton(bool isDown, int button, bool isPlayer1) {
+        if (m_fields->isSimulating || !ConsoleManager::get().isEnabled() || !isDown) {
+            GJBaseGameLayer::handleButton(isDown, button, isPlayer1);
             return;
         }
 
-        PlayerObject* target = isPlayer2 ? m_player2 : m_player1;
+        PlayerObject* target = isPlayer1 ? m_player1 : m_player2;
         float stepDt = 1.0f / 240.0f;
 
         if (wouldInputKill(target, true, stepDt)) {
-            m_fields->pendingInputs.push_back({ true, isPlayer2, 0 });
+            m_fields->pendingInputs.push_back({ isDown, button, isPlayer1, 0 });
             return;
         }
 
-        GJBaseGameLayer::pushButton(state, isPlayer2);
+        GJBaseGameLayer::handleButton(isDown, button, isPlayer1);
     }
 
     void update(float dt) {
         if (ConsoleManager::get().isEnabled() && !m_fields->pendingInputs.empty()) {
             auto& nextInput = m_fields->pendingInputs.front();
-            PlayerObject* target = nextInput.isPlayer2 ? m_player2 : m_player1;
+            PlayerObject* target = nextInput.isPlayer1 ? m_player1 : m_player2;
             int maxTicks = ConsoleManager::get().getMaxTicks();
 
             if (!wouldInputKill(target, nextInput.isDown, dt) || nextInput.ticksDelayed >= maxTicks) {
                 if (nextInput.ticksDelayed > 0) {
                     ConsoleManager::get().logSavedInput(nextInput.ticksDelayed, nextInput.isDown);
                 }
-                GJBaseGameLayer::pushButton(0, !nextInput.isPlayer2);
+                GJBaseGameLayer::handleButton(nextInput.isDown, nextInput.button, nextInput.isPlayer1);
                 m_fields->pendingInputs.pop_front();
             } else {
                 nextInput.ticksDelayed++;
             }
         }
 
-        PlayLayer::update(dt);
-    }
-
-    void destroyPlayer(PlayerObject* player, GameObject* object) {
-        if (m_fields->isSimulating) {
-            player->m_isDead = true;
-            return;
-        }
-        PlayLayer::destroyPlayer(player, object);
+        GJBaseGameLayer::update(dt);
     }
 };
 
+// Inicialización de consola al abrir nivel
+class $modify(LookaheadPlayLayer, PlayLayer) {
+    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
+        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
+        ConsoleManager::get().initConsole();
+        return true;
+    }
+};
+
+// Hook de la tecla F6
 class $modify(BufferKeyboardHook, CCKeyboardDispatcher) {
     bool dispatchKeyboardMSG(enumKeyCodes key, bool isKeyDown, bool isKeyRepeat, double timestamp) {
         if (isKeyDown && !isKeyRepeat && key == enumKeyCodes::KEY_F6) {

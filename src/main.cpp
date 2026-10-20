@@ -64,7 +64,7 @@ public:
 
             std::cout << "========================================================\n";
             std::cout << "[InputBuffer] LOADED - Lookahead Prediction Engine Active\n";
-            std::cout << "[InputBuffer] F6: ciclar OFF -> 2T -> 4T -> 8T | F7: lookahead 15/30/60/120/240 ticks\n";
+            std::cout << "[InputBuffer] F6: ciclar OFF -> 2T -> 4T -> 8T | F7: lookahead 15/30/60/120/240 | F8: debug\n";
             std::cout << "========================================================\n\n";
             std::cout << std::flush;
             m_initialized = true;
@@ -103,6 +103,9 @@ public:
     bool simulationDied = false;
     bool isFlushing = false;
 
+    // Logs detallados de simulacion (F8). Apagado por defecto.
+    bool debug = false;
+
     // Ticks que se simulan hacia delante tras el press (F7 los cambia: 15 / 30 / 60 / 120 / 240)
     int lookahead = LOOKAHEAD_TICKS;
 
@@ -117,6 +120,11 @@ public:
         float ms = lookahead * (1000.0f / 240.0f);
         std::cout << "[InputBuffer] F7 -> lookahead = " << lookahead
                   << " ticks (" << ms << " ms)\n" << std::flush;
+    }
+
+    void toggleDebug() {
+        debug = !debug;
+        std::cout << "[InputBuffer] F8 -> debug " << (debug ? "ON" : "OFF") << "\n" << std::flush;
     }
 
     // dt real de un tick de fisica (se actualiza desde processCommands)
@@ -177,9 +185,10 @@ class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
 
         for (int t = 0; t < total; ++t) {
             if (t == delay) {
-                player->pushButton(static_cast<PlayerButton>(button));
+                // Mismo camino que el juego real (no pushButton a pelo)
+                GJBaseGameLayer::handleButton(true, button, true);
             } else if (t == delay + ASSUMED_HOLD_TICKS) {
-                player->releaseButton(static_cast<PlayerButton>(button));
+                GJBaseGameLayer::handleButton(false, button, true);
             }
             player->update(dt);
             this->checkCollisions(player, dt, false);
@@ -221,31 +230,37 @@ class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
             PlayerObject* target = m_player1;
             int maxTicks = st.getMaxTicks();
 
-            std::cout << "[InputBuffer][DEBUG] PRESS btn=" << button
-                      << " x=" << target->getPositionX()
-                      << " y=" << target->getPositionY()
-                      << " dead=" << target->m_isDead
-                      << " dt=" << st.stepDt << "\n";
+            if (st.debug) {
+                std::cout << "[InputBuffer][DEBUG] PRESS btn=" << button
+                          << " x=" << target->getPositionX()
+                          << " y=" << target->getPositionY()
+                          << " dead=" << target->m_isDead
+                          << " dt=" << st.stepDt << "\n";
+            }
 
             // Buscamos el menor retraso d (0..max) con el que NO mueres
             int safeDelay = -1;
             for (int d = 0; d <= maxTicks; ++d) {
                 SimResult r = simulateDies(target, d, button);
-                std::cout << "    [sim] retraso=" << d
-                          << " muere=" << r.died
-                          << " en_tick=" << r.deathTick
-                          << " x:" << r.xStart << "->" << r.xEnd
-                          << " y:" << r.yStart << "->" << r.yEnd << "\n";
+                if (st.debug) {
+                    std::cout << "    [sim] retraso=" << d
+                              << " muere=" << r.died
+                              << " en_tick=" << r.deathTick
+                              << " x:" << r.xStart << "->" << r.xEnd
+                              << " y:" << r.yStart << "->" << r.yEnd << "\n";
+                }
                 if (!r.died) {
                     safeDelay = d;
                     break;
                 }
             }
-            std::cout << "    => retraso_seguro=" << safeDelay << " (max " << maxTicks << ")\n" << std::flush;
+            if (st.debug) {
+                std::cout << "    => retraso_seguro=" << safeDelay << " (max " << maxTicks << ")\n" << std::flush;
+            }
 
             if (safeDelay > 0) {
                 float ms = safeDelay * (1000.0f / 240.0f);
-                std::cout << "[InputBuffer] SAVED: press retrasado " << safeDelay
+                std::cout << "[InputBuffer] Retrasado " << safeDelay
                           << " ticks (" << ms << " ms)\n" << std::flush;
                 st.queue.push_back({ isDown, button, isPlayer1, 0, safeDelay });
                 st.debugCalls = 0;
@@ -264,7 +279,7 @@ class $modify(PredictiveBaseLayer, GJBaseGameLayer) {
         if (!st.isSimulating) st.stepDt = dt > 0.f ? dt : st.stepDt;
 
         if (st.isEnabled() && !st.queue.empty()) {
-            if (st.debugCalls < 12) {
+            if (st.debug && st.debugCalls < 12) {
                 std::cout << "[InputBuffer][DEBUG] processCommands dt=" << dt
                           << " half=" << isHalfTick << " last=" << isLastTick
                           << " cola=" << st.queue.size() << "\n" << std::flush;
@@ -314,10 +329,6 @@ class $modify(PredictivePlayLayer, PlayLayer) {
             BufferState::get().simulationDied = true;
             return;
         }
-        if (player == m_player1) {
-            std::cout << "[InputBuffer][DEBUG] MUERTE REAL x=" << player->getPositionX()
-                      << " y=" << player->getPositionY() << "\n" << std::flush;
-        }
         PlayLayer::destroyPlayer(player, object);
     }
 };
@@ -329,6 +340,9 @@ class $modify(BufferKeyboardHook, CCKeyboardDispatcher) {
         }
         if (isKeyDown && !isKeyRepeat && key == enumKeyCodes::KEY_F7) {
             BufferState::get().cycleLookahead();
+        }
+        if (isKeyDown && !isKeyRepeat && key == enumKeyCodes::KEY_F8) {
+            BufferState::get().toggleDebug();
         }
         return CCKeyboardDispatcher::dispatchKeyboardMSG(key, isKeyDown, isKeyRepeat, timestamp);
     }
